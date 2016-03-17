@@ -9,7 +9,7 @@ U GitHub->JIRA. `ughjira`. Get it?
  1. Configure `dot.ughjira.conf` and put it in `$HOME/.ughjira.conf`.
  2. Run `carton install`.
  3. Run `carton exec ./ughjira`.
- 4. Be happy you didn't have to wade throughjira the half-finished, mostly broken
+ 4. Be happy you didn't have to wade through the half-finished, mostly broken
     GitHub API implementations in Perl and spend way too many hours figuring
     out that there is no good way to convert Markdown -> Confluence.
  5. Send a PR or file an issue if you have an error, and accept my apologies if
