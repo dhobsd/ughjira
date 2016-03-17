@@ -17,7 +17,7 @@ U GitHub->JIRA. `ughjira`. Get it?
 
 ## Features
 
-`Ugh` imports issues from GitHub into JIRA, and attempts to be friendly in the
+`Ughjira` imports issues from GitHub into JIRA, and attempts to be friendly in the
 following ways:
 
  1. It attempts to preserve (to the best of its ability) formatting in issue
