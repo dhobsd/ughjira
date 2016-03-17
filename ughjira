@@ -1,0 +1,188 @@
+#!/usr/bin/perl
+# Copyright (c) 2016 Devon H. O'Dell <dho@fastly.com>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+use warnings;
+use strict;
+use utf8;
+use Data::Dumper qw/Dumper/;
+use Env qw($HOME);
+use Config::Simple;
+use LWP::UserAgent;
+use HTTP::Request;
+use JIRA::REST;
+use JSON::XS;
+
+binmode STDOUT, ":encoding(UTF-8)";
+
+my $cfg = new Config::Simple("$HOME/.ughjira.conf") or die "Cannot load $HOME/.ughjira.conf: $!\n";
+
+my $jirauser = $cfg->param('jirauser') or die "Setting 'jirauser' missing from $HOME/.ughjira.conf\n";
+my $jirapass = $cfg->param('jirapass') or die "Setting 'jirapass' missing from $HOME/.ughjira.conf\n";
+my $jirasite = $cfg->param('jirasite') or die "Setting 'jirasite' missing from $HOME/.ughjira.conf\n";
+my $jiraproj = $cfg->param('jiraproj') or die "Setting 'jiraproj' missing from $HOME/.ughjira.conf\n";
+
+my $ghrepo = $cfg->param('ghrepo') or die "Setting 'ghrepo' missing from $HOME/.ughjira.conf\n";
+my $ghuser = $cfg->param('ghuser') or die "Setting 'ghuser' missing from $HOME/.ughjira.conf\n";
+my $ghapi = $cfg->param('ghapi') or die "Setting 'ghapi' missing from $HOME/.ughjira.conf\n";
+my $ghuri = $cfg->param('ghuri') or die "Setting 'ghuri' missing from $HOME/.ughjira.conf\n";
+my $ghtoken = $cfg->param('ghtoken') or die "Setting 'ghtoken' missing from $HOME/.ughjira.conf\n";
+
+my $usermap_cfg = $cfg->param('usermap') or die "Setting 'usermap' missing from $HOME/.ughjira.conf\n";
+
+my $jira = JIRA::REST->new($jirasite, $jirauser, $jirapass) || die "Couldn't log in to JIRA";
+
+my $ua = LWP::UserAgent->new;
+$ua->default_header('Authorization' => "ghtoken $ghtoken");
+$ua->default_header('Accept' => 'application/vnd.github.v3+json');
+
+my %usermap_h = @{$usermap_cfg};
+my $usermap = \%usermap_h;
+
+sub fmt {
+	my $body = shift;
+
+	# Handle code formatting
+	$body =~ s/```C/{code}/mg;
+	$body =~ s/```/{code}/mg;
+
+	# Handle headings
+	$body =~ s/^####\s+/h4./mg;
+	$body =~ s/^###\s+/h3./mg;
+	$body =~ s/^##\s+/h2./mg;
+	$body =~ s/^#\s+/h1./mg;
+
+	# Handle inline code blocks
+	$body =~ s/`(.*?)`/{{$1}}/mg;
+
+	# Handle " - [ ]" -> list; no JIRA markup analogue
+	$body =~ s/^\s*-\s*\[(\s|x)*\]/*/mg;
+
+	# Handle mentions for any user we know about.
+	foreach my $key (keys %{$usermap}) {
+		$body =~ s/\@$key\b/[~$usermap->{$key}]/mg;
+	}
+
+	# Handle links
+	$body =~ s/\[([^\]]+)\]\(([^\)]+)\)/[$1|$2]/mg;
+
+	# Handle user repo cross-references.
+	$body =~ s@(\w+)/([\w-]+)#(\d+)( |,|\.|\)|$)@[$1/$2#$3|$ghuri/$1/$2/issues/$3]$4@mg;
+
+	# Handle intra-repo references.
+	$body =~ s@#(\d+)( |,|\.|\)|$)@[#$1|$ghuri/$ghuser/$ghrepo/issues/$1]$2@mg;
+
+	# TODO: Blockquotes, images, other formatting.
+
+	return $body;
+}
+
+my $uristem = "$ghapi/repos/$ghuser/$ghrepo";
+my $next = "$uristem/issues?per_page=100";
+while ($next) {
+	my $r = $ua->get($next);
+	if ($r->is_success) {
+		my $issues = decode_json($r->decoded_content);
+		foreach my $issue (@$issues) {
+			next if $issue->{pull_request};
+			
+			my $user = $usermap->{$issue->{user}->{login}};
+			my $title = $issue->{title};
+			my $ghurl = $issue->{url};
+			my $body = fmt($issue->{body});
+
+			my $issnum = $issue->{number};
+
+			my @labels;
+			foreach my $label (@{$issue->{labels}}) {
+				my $lname = $label->{name};
+
+				$lname =~ s/\s+/-/g;
+
+				push @labels, $lname;
+			}
+
+			my $res = $jira->POST('/issue', undef, {
+				fields => {
+					project => {
+						"key" => $jiraproj,
+					},
+					"issuetype" => {
+						"name" => "Task",
+					},
+					"summary"		=> $title,
+					"description"		=> "From [~$user] at [GitHub|$ghurl]:\n\n$body",
+					"labels"		=> \@labels,
+				},
+			});
+
+			my $key = $res->{key};
+
+			if ($issue->{comments} > 0) {
+				my $cr = $ua->get($issue->{comments_url});
+				if ($cr->is_success) {
+					my $cs = decode_json($cr->decoded_content);
+
+					foreach my $c (@$cs) {
+						my $cuser = $usermap->{$c->{user}->{login}};
+						my $curl = $c->{html_url};
+						my $cbody = fmt($c->{body});
+						my $cres = $jira->POST("/issue/$key/comment", undef, {
+							"body" => "From [~$cuser] at [GitHub|$curl]:\n\n$cbody",
+						});
+					}
+				}
+			}
+
+			my $upUri = "$uristem/issues/$issnum/comments";
+			my $upJson = encode_json({
+				body => "Issue moved to [JIRA]($jirasite/browse/$key)" 
+			});
+			my $upReq = HTTP::Request->new('POST', $upUri);
+			$upReq->header('Content-Type' => 'application/json');
+			$upReq->content($upJson);
+			$ua->request($upReq);
+
+			my $closeJson = encode_json({ 'state' => 'closed' });
+			my $closeReq = HTTP::Request->new('PATCH', "$uristem/issues/$issnum");
+			$closeReq->header('Content-Type' => 'application/json');
+			$closeReq->content($closeJson);
+			$ua->request($closeReq);
+
+			print "GitHub $issnum -> JIRA $key\n";
+		}
+
+		$next = undef;
+		my $lh = $r->header('Link');
+		my @rels = split /,/, $lh;
+		foreach my $rel (@rels) {
+			my ($uri, $reldef) = split /;/, $rel;
+
+			if ($reldef =~ m/next/) {
+				$uri =~ s/<>//g;
+				$next = $uri;
+				last;
+			}
+		}
+	} else {
+		die "Failed $r->status_line";
+	}
+}
+
