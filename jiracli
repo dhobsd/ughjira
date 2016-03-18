@@ -1,0 +1,412 @@
+#!/usr/bin/perl
+# Copyright (c) 2016 Devon H. O'Dell <dho@fastly.com>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+use warnings;
+use strict;
+use utf8;
+use Data::Dumper qw/Dumper/;
+use Env qw($HOME);
+use Config::Simple;
+use JIRA::REST;
+use Term::ReadLine;
+
+my $term = Term::ReadLine->new('jiracli');
+my $OUT = $term->OUT || \*STDOUT;
+
+binmode $OUT, ":encoding(UTF-8)";
+
+my $cfg = new Config::Simple("$HOME/.ughjira.conf") or die "Cannot load $HOME/.ughjira.conf: $!\n";
+my $jirauser = $cfg->param('jirauser') or die "Setting 'jirauser' missing from $HOME/.ughjira.conf\n";
+my $jirapass = $cfg->param('jirapass') or die "Setting 'jirapass' missing from $HOME/.ughjira.conf\n";
+my $jirasite = $cfg->param('jirasite') or die "Setting 'jirasite' missing from $HOME/.ughjira.conf\n";
+my $jiraproj = $cfg->param('jiraproj') or die "Setting 'jiraproj' missing from $HOME/.ughjira.conf\n";
+
+print $OUT "💩   Welcome to JIRA! 💩 \nPlease be patient while we load a bunch of crap about your installation.\n";
+
+my $jira = JIRA::REST->new($jirasite, $jirauser, $jirapass) || die "Couldn't log in to JIRA";
+
+my $res = eval { $jira->GET('/field'); };
+die "Could not get field information: $@" unless $res;
+
+my $customfields_i2n = {};
+my $customfields_n2i = {};
+foreach my $field (@{$res}) {
+	$customfields_i2n->{$field->{id}} = $field->{name};
+	$customfields_n2i->{$field->{name}} = $field->{id};
+}
+
+my $projects = {};
+my $createmeta = {};
+$res = eval { $jira->GET('/issue/createmeta', { expand => 'projects.issuetypes.fields' }); };
+return "Couldn't resolve creation fields: $@" unless $res;
+
+foreach my $project (@{$res->{projects}}) {
+	$projects->{$project->{key}} = $project;
+}
+
+my $curproj = $jiraproj;
+my $curpage = 0;
+my $curissue = undef;
+my $perpage = 10;
+my $nresults = 0;
+my $jql = undef;
+my @prevargs = undef;
+my $prevcmd = undef;
+
+my $prompt = "$curproj J> ";
+
+sub do_search {
+	my ($jql, $off, @fields) = @_;
+
+	return $jira->POST('/search', {
+		expand		=> 'names',
+	}, {
+		jql		=> $jql,
+		startAt		=> $off,
+		maxResults	=> $perpage,
+		fields		=> @fields,
+	});
+}
+
+sub comments {
+	my $iss = shift;
+	$iss = $curissue if !defined($iss);
+	return "No issue specified" if !defined($iss);
+
+	my $res = eval { $jira->GET("/issue/$iss/comment"); };
+	return "Error retrieving comments: $@" if !defined($res);
+
+	my $ret = '';
+	foreach my $comment (@{$res->{comments}}) {
+		$ret .= "Comment From $comment->{author}->{displayName} on $comment->{created}:\n\t$comment->{body}\n";
+	}
+
+	chop $ret;
+	return $ret;
+}
+
+sub comment {
+	my $body = shift;
+	return "No issue selected (use `show` command)" if !defined($curissue);
+	return "No comment provided" if !defined($body);
+
+	my $c = { body => $body };
+	my $res = eval { $jira->POST("/issue/$curissue/comment", undef, $c); };
+	return "Couldn't create comment: $@" if !defined($res);
+
+	return "Comment at $res->{self}";
+}
+
+sub create {
+	my $issue = {};
+
+	my $idx = 0;
+	my @itypes = @{$projects->{$curproj}->{issuetypes}};
+
+	foreach my $itype (@itypes) {
+		print $OUT "$idx. " . $itype->{name} . "\n";
+		$idx++;
+	}
+
+	my $itype = $term->readline("Issue type: ");
+	return "Invalid issue type" if ($itype >= $idx);
+
+	$issue->{fields} = {
+		issuetype => {
+			id => $itypes[$itype]->{id}
+		},
+		project => {
+			id => $projects->{$curproj}->{id}
+		},
+	};
+
+	foreach my $field (sort keys %{$itypes[$itype]->{fields}}) {
+		my $hr = $itypes[$itype]->{fields}->{$field};
+
+		next if !$hr->{required};
+		next if $field eq 'project' or $field eq 'issuetype';
+
+		my $fname = $hr->{name};
+		$fname = $customfields_i2n->{$fname} if ($fname =~ m/^customfield_/);
+
+		my $l = $term->readline("$hr->{name}: ");
+		if (!defined($l) || $l =~ m/^\s*$/mg) {
+			return "Field $hr->{name} required";
+		}
+
+		$issue->{fields}->{$field} = $l;
+	}
+
+	my $res = eval { $jira->POST('/issue', undef, $issue); };
+	return "Error creating issue: $@" if !defined($res);
+
+	return "Created issue $res->{key}";
+}
+
+sub help {
+	my $topic = shift;
+
+	my $result;
+	if (!defined($topic)) {
+		$result = <<EOF
+Commands:
+    co
+    comment [key]			Comment on the issue with the provided key
+
+    cs
+    comments [key]			Show comments on the issue with the provided key
+
+    c
+    create				Create a new issue in the current project
+
+    h
+    help				This help text
+
+    n
+    next				Next page of results
+
+    o
+    open [n]				List n open issues. Default for n is 10
+
+    p
+    project				List available projects
+    project [proj]			Set active CLI JIRA project key
+
+    q
+    quit				Exit the CLI
+
+    r
+    reset				Reset to initial context
+
+    se
+    search [n] [jql]			Search for issues matching JQL, returning n per page
+
+    s
+    sh
+    show [key]				Show the issue with the provided key
+EOF
+	}
+
+	return $result;
+}
+
+sub next {
+	my $off = $curpage * $perpage;
+	my $ret = '';
+
+	return "No more results" if ($off >= $nresults);
+
+	my $res = eval { do_search($jql, $off, [ qw/summary assignee/ ]) };
+	return "Error with search: $@" unless ($res);
+
+	foreach my $issue (@{$res->{issues}}) {
+		my $name = $issue->{fields}->{assignee}->{displayName};
+		$name ||= $issue->{fields}->{assignee}->{key};
+		$name ||= "unassigned";
+		$ret .= "[$issue->{key}] ($name): $issue->{fields}->{summary}\n";
+	}
+
+	$curpage++;
+
+	my $p = $curpage * $perpage;
+	$p = $nresults if ($p > $nresults);
+
+	$prompt = "$curproj open $p/$nresults J> ";
+
+	return $ret;
+}
+
+sub open {
+	my $count = shift;
+	my $ret = '';
+
+	$perpage = $count if (defined $count);
+	$jql = qq/project = "$curproj" and status = "open"/;
+
+	my $res = eval { do_search($jql, 0, [ qw/summary assignee/ ]) };
+	return "Error with search: $@" unless ($res);
+
+	$nresults = $res->{total};
+	foreach my $issue (@{$res->{issues}}) {
+		my $name = $issue->{fields}->{assignee}->{displayName};
+		$name ||= $issue->{fields}->{assignee}->{key};
+		$name ||= "unassigned";
+		$ret .= "[$issue->{key}] ($name): $issue->{fields}->{summary}\n"
+	}
+
+	$curpage = 1;
+
+	my $p = $perpage;
+	$p = $nresults if ($perpage > $nresults);
+
+	$prompt = "$curproj open $p/$nresults J> ";
+
+	return $ret;
+}
+
+sub project {
+	my $project = shift;
+
+	if (!defined($project)) {
+		my $ret = '';
+		foreach my $project (keys %{$projects}) {
+			$ret .= "$project:\t" . $projects->{$project}->{name} . "\n";
+		}
+
+		return $ret;
+	}
+
+	$curproj = $project;
+	$prompt = "$curproj J> ";
+	return "Project set to: $curproj";
+}
+
+sub quit {
+	print $OUT "Bye.\n";
+	exit 0;
+}
+
+sub reset {
+	$curpage = 0;
+	$nresults = 0;
+	$perpage = 10;
+	$curissue = undef;
+	$curproj = $jiraproj;
+	$jql = undef;
+	@prevargs = undef;
+	$prevcmd = undef;
+
+	$prompt = "$jiraproj J> ";
+}
+
+sub search {
+	my $count = shift;
+	my $query = join ' ', @_;
+
+	return "No JQL provided" if (!defined($query));
+	return "No count specified" if (!defined($count));
+
+	my $ret = '';
+
+	$perpage = $count;
+	$jql = $query;
+
+	my $res = eval { do_search($jql, 0, [ qw/summary assignee/ ]) };
+	return "Error with search: $@" unless ($res);
+
+	$nresults = $res->{total};
+	foreach my $issue (@{$res->{issues}}) {
+		my $name = $issue->{fields}->{assignee}->{displayName};
+		$name ||= $issue->{fields}->{assignee}->{key};
+		$name ||= "unassigned";
+		$ret .= "[$issue->{key}] ($name): $issue->{fields}->{summary}\n"
+	}
+
+	$curpage = 1;
+
+	my $p = $perpage;
+	$p = $nresults if ($perpage > $nresults);
+	$prompt = "$curproj search $p/$nresults J> ";
+
+	return $ret;
+}
+
+sub show {
+	my $key = shift;
+
+	return "No issue specified" if (!defined($key));
+
+	my $res = eval {
+		$jira->GET("/issue/$key", { expand => 'names' });
+	};
+	return "Error with getting issue '$key': $@" unless ($res);
+
+	$curissue = $key;
+	return <<EOF
+Issue [$key]:
+Summary:   $res->{fields}->{summary}
+Priority:  $res->{fields}->{priority}->{name}
+Description:
+$res->{fields}->{description}
+EOF
+}
+
+my $main_cmds = {
+	'co'		=> \&comment,
+	'comment'	=> \&comment,
+
+	'cs'		=> \&comments,
+	'comments'	=> \&comments,
+
+	'c'		=> \&create,
+	'create'	=> \&create,
+
+	'h'		=> \&help,
+	'help'		=> \&help,
+
+	'n'		=> \&next,
+	'next'		=> \&next,
+
+	'o'		=> \&open,
+	'open'		=> \&open,
+
+	'p'		=> \&project,
+	'project'	=> \&project,
+
+	'q'		=> \&quit,
+	'quit'		=> \&quit,
+
+	'r'		=> \&reset,
+	'reset'		=> \&reset,
+
+	'se'		=> \&search,
+	'search'	=> \&search,
+
+	's'		=> \&show,
+	'sh'		=> \&show,
+	'show'		=> \&show,
+};
+
+sub handle_arg {
+	my $cmd = shift;
+	my @args = @_;
+
+	if (!defined ($cmd)) {
+		$cmd = $prevcmd if (!defined($cmd));
+		@args = @prevargs if (!@args);
+	}
+
+	$prevcmd = $cmd;
+	@prevargs = @args;
+
+	return "Invalid command: $cmd\n" . $main_cmds->{'help'}() if !defined($main_cmds->{$cmd});
+	
+	return $main_cmds->{$cmd}(@args);
+}
+
+while (defined (my $line = $term->readline($prompt))) {
+	my @args = split /\s+/, $line;
+
+	my $res = handle_arg(@args);
+	print $OUT $res, "\n";
+}
+
+print $OUT "\n";
