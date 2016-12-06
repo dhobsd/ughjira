@@ -5,3 +5,4 @@ requires 'LWP::UserAgent';
 requires 'JSON::XS';
 requires 'HTTP::Request';
 requires 'Term::ReadLine';
+requires 'GraphViz2';

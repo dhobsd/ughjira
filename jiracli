@@ -25,6 +25,7 @@ use utf8;
 use Data::Dumper qw/Dumper/;
 use Env qw($HOME);
 use Config::Simple;
+use GraphViz2;
 use JIRA::REST;
 use Term::ReadLine;
 
@@ -161,6 +162,135 @@ sub create {
 	return "Created issue $res->{key}";
 }
 
+sub status_color {
+	my $status = shift;
+
+	return 'black';
+}
+
+sub status_bgcolor {
+	my $status = shift;
+
+	if ($status eq 'done') {
+		return 'gray';
+	} else {
+		return 'black';
+	}
+}
+
+sub status_width {
+	my $status = shift;
+
+	return 2.5 if $status !~ m/(new|done)/;
+
+	return 1.0;
+}
+
+sub status_label {
+	my ($status, $label) = @_;
+
+	if ($status ne 'indeterminate') {
+		return "$label ($status)";
+	} else {
+		return $label
+	}
+}
+
+sub graph {
+	my $iss = shift;
+	my $recursionmap = shift;
+	my $graph = shift;
+
+	$iss = $curissue if !defined($iss);
+	return "No issue specified" if !defined($iss);
+
+	if (defined $recursionmap && defined $recursionmap->{$iss}) {
+		return;
+	}
+
+	my $res = eval {
+		$jira->GET("/issue/$iss", { expand => 'names' });
+	};
+	return "Error with getting issue '$iss': $@" unless ($res);
+
+
+	$graph = GraphViz2->new(
+		edge	=> { color => 'grey' },
+		global	=> { directed => 1 },
+		graph	=> { label => "$iss Dependencies", rankdir => 'LR' },
+		node	=> { shape => 'box', style => 'rounded,filled', fontcolor => 'white' },
+	) unless defined $graph;
+
+	my $status = ($res->{fields}->{status}->{statusCategory}->{key});
+	my $color = status_color($status);
+	my $bgcolor = status_bgcolor($status);
+	my $width = status_width($status);
+	$graph->add_node(name => $iss, shape => 'box', color => $bgcolor, fillcolor => $bgcolor) unless defined ($recursionmap);
+
+	my $epic_issues = undef;
+	my $do_recurse = 0;
+	if (is_epic($res)) {
+		$jql = '"' . $cfg->param('epiclink') . '"="' .  $res->{fields}->{$customfields_n2i->{$cfg->param('epicname')}} . '"';
+		my $perpage_stash = $perpage;
+		$perpage = 1000;
+		$epic_issues = eval { do_search($jql, 0, [ qw/summary status/ ]) };
+		return "Error with search: $@" unless $epic_issues;
+		$perpage = $perpage_stash;
+		$do_recurse = 1;
+	}
+
+	$recursionmap = { $iss => 1 } unless defined $recursionmap;
+
+	foreach my $link (@{$res->{fields}->{issuelinks}}) {
+		my $outward = defined ($link->{outwardIssue}) ? 1 : 0;
+		my $linktype = $link->{type}->{name};
+		my $fromkey = '';
+		my $tokey = '';
+		my $key = '';
+		my $status = '';
+
+		if ($outward) {
+			$fromkey = $iss;
+			$key = $tokey = $link->{outwardIssue}->{key};
+			$status = $link->{outwardIssue}->{fields}->{status}->{statusCategory}->{key};
+		} else {
+			$tokey = $iss;
+			$key = $fromkey = $link->{inwardIssue}->{key};
+			$status = $link->{inwardIssue}->{fields}->{status}->{statusCategory}->{key};
+		}
+
+
+		$color = status_color($status);
+		my $bgcolor = status_bgcolor($status);
+		my $width = status_width($status);
+		my $label = status_label($status, $link->{type}->{outward});
+
+		$graph->add_node(name => $key, color => $bgcolor, fillcolor => $bgcolor);
+		$graph->add_edge(from => $fromkey, to => $tokey, label => $label, color => $bgcolor, penwidth => $width, fillcolor => $bgcolor, fontcolor => $color);
+
+		$recursionmap->{$key} = 1;
+
+		graph($key, $recursionmap, $graph);
+	}
+
+	if ($do_recurse) {
+		foreach my $link (@{$epic_issues->{issues}}) {
+			my $status = $link->{fields}->{status}->{statusCategory}->{key};
+
+			$color = status_color($status);
+			my $bgcolor = status_bgcolor($status);
+			my $width = status_width($status);
+			my $label = status_label($status, 'Epic Link');
+
+			$graph->add_node(name => $link->{key}, color => $bgcolor, fillcolor => $bgcolor);
+			$graph->add_edge(from => $iss, to => $link->{key}, label => $label, fontcolor => 'black', penwidth => $width, fillcolor => $bgcolor, color => $bgcolor);
+			graph($link->{key}, $recursionmap, $graph);
+		}
+	}
+
+	eval { $graph->run(format => 'svg', output_file => "./$iss.svg") };
+}
+
 sub help {
 	my $topic = shift;
 
@@ -176,6 +306,13 @@ Commands:
 
     c
     create				Create a new issue in the current project
+
+    e
+    epic				Jump to epic for the current issue
+
+    g
+    graph [key]				Creates a dependency graph, outputs to key.svg
+					Uses current issue if no key is provided.
 
     h
     help				This help text
@@ -329,6 +466,16 @@ sub search {
 	return $ret;
 }
 
+sub is_epic {
+	my $obj = shift;
+
+	if (defined $obj->{fields}->{$customfields_n2i->{$cfg->param('epicname')}}) {
+		return 1;
+	}
+
+	return 0;
+}
+
 sub show {
 	my $key = shift;
 
@@ -339,11 +486,28 @@ sub show {
 	};
 	return "Error with getting issue '$key': $@" unless ($res);
 
+	my $isstype = "Issue";
+	my $epic_text = "Epic: ";
+
+	if (is_epic($res)) {
+		$isstype = "Epic";
+		$isstype = "Epic";
+		$epic_text .= 'This issue is an epic';
+	} else {
+		$epic_text .= defined($res->{fields}->{$customfields_n2i->{$cfg->param('epiclink')}})
+			?  $res->{fields}->{$customfields_n2i->{$cfg->param('epiclink')}}
+			: 'This issue is not part of an epic';
+	}
+
 	$curissue = $key;
+
+	$prompt = "$curproj show $curissue J> ";
+
 	return <<EOF
-Issue [$key]:
+$isstype [$key]:
 Summary:   $res->{fields}->{summary}
 Priority:  $res->{fields}->{priority}->{name}
+$epic_text
 Description:
 $res->{fields}->{description}
 EOF
@@ -358,6 +522,12 @@ my $main_cmds = {
 
 	'c'		=> \&create,
 	'create'	=> \&create,
+
+	'e'		=> \&epic,
+	'epic'		=> \&epic,
+
+	'g'		=> \&graph,
+	'graph'		=> \&graph,
 
 	'h'		=> \&help,
 	'help'		=> \&help,
